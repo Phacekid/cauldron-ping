@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 import { config } from "./config.js";
 
 const ZERO_HASH = "0".repeat(64);
+const REORDER_MS = config.reorderWindowMs ?? 700; // collect updates this long before applying them
+const ORPHAN_WAIT_MS = config.orphanWaitMs ?? 5000; // how long to wait for a missing earlier update
 
 // Tracks every active pool of each watched token (via cauldron.contract.subscribe)
 // and turns pool state changes into buy/sell events.
@@ -18,6 +20,9 @@ export class PoolTracker extends EventEmitter {
     this.ready = new Set(); // tokens whose initial state is loaded
     this.pending = new Map(); // txid -> aggregation while we wait for sibling updates
     this.seen = new Set(); // txids already emitted
+    this.spent = new Set(); // utxo hashes already spent, so late/out-of-order updates can't re-add them
+    this.buffers = new Map(); // tokenId -> updates waiting to be applied in order
+    this.timers = new Map(); // tokenId -> drain timer
     this.limitHit = false;
     this.stats = { updates: 0, trades: 0 };
 
@@ -72,8 +77,9 @@ export class PoolTracker extends EventEmitter {
       this.tokens.set(token.id, token);
       const state = new Map();
       for (const u of res?.utxos ?? []) {
-        if (!u.is_withdrawn)
-          state.set(u.new_utxo_hash, { sats: u.sats, tokens: u.token_amount });
+        if (u.is_withdrawn) continue;
+        this.spent.delete(u.new_utxo_hash); // fresh snapshot is the truth
+        state.set(u.new_utxo_hash, { sats: u.sats, tokens: u.token_amount });
       }
       this.pools.set(token.id, state);
       this.ready.add(token.id);
@@ -97,6 +103,9 @@ export class PoolTracker extends EventEmitter {
     return { sats, tokens, price: tokens > 0 ? sats / tokens : 0 };
   }
 
+  // Updates are buffered per token for a short window, then applied in chain order
+  // (each pool update spends the previous one), so trades that arrive out of order
+  // are still read correctly and shown one by one, oldest first.
   onUpdate(params) {
     const utxos = params?.utxos ?? [];
     this.stats.updates++;
@@ -111,58 +120,114 @@ export class PoolTracker extends EventEmitter {
           .join(" | "),
       );
     }
+    for (const u of utxos) {
+      if (!this.ready.has(u.token_id)) continue;
+      const list = this.buffers.get(u.token_id) ?? [];
+      list.push({ u, at: Date.now() });
+      this.buffers.set(u.token_id, list);
+      this.scheduleDrain(u.token_id, REORDER_MS);
+    }
+  }
 
-    // 1) capture old values of spent pools before touching state
-    const olds = utxos.map((u) =>
-      this.pools.get(u.token_id)?.get(u.spent_utxo_hash),
+  scheduleDrain(tokenId, ms) {
+    if (this.timers.has(tokenId)) return;
+    this.timers.set(
+      tokenId,
+      setTimeout(() => {
+        this.timers.delete(tokenId);
+        this.drain(tokenId);
+      }, ms),
     );
+  }
 
-    // 2) make sure we know the pre-trade price for each tx
-    utxos.forEach((u) => {
-      if (!this.ready.has(u.token_id) || this.seen.has(u.new_utxo_txid)) return;
-      if (!this.pending.has(u.new_utxo_txid)) {
-        const before = this.snapshot(u.token_id);
-        this.pending.set(u.new_utxo_txid, {
-          tokenId: u.token_id,
-          txid: u.new_utxo_txid,
-          priceBefore: before.price,
-          buy: { sats: 0, tokens: 0 },
-          sell: { sats: 0, tokens: 0 },
-          timer: null,
-        });
+  drain(tokenId) {
+    const state = this.pools.get(tokenId);
+    let items = this.buffers.get(tokenId) ?? [];
+    this.buffers.delete(tokenId);
+    if (!state || !this.ready.has(tokenId)) return;
+
+    const known = (u) =>
+      u.spent_utxo_hash === ZERO_HASH || state.has(u.spent_utxo_hash);
+    const duplicate = (u) =>
+      !known(u) &&
+      (state.has(u.new_utxo_hash) || this.spent.has(u.new_utxo_hash));
+
+    // apply whatever has its parent pool state, repeat until nothing more can be placed
+    let progress = true;
+    while (items.length && progress) {
+      progress = false;
+      const rest = [];
+      for (const it of items) {
+        if (known(it.u)) {
+          this.apply(tokenId, state, it.u);
+          progress = true;
+        } else if (duplicate(it.u)) {
+          progress = true; // repeat notification (e.g. on confirmation), already applied
+        } else {
+          rest.push(it);
+        }
       }
-    });
-
-    // 3) add new utxos, then 4) remove spent ones (server order is not topological)
-    for (const u of utxos) {
-      const state = this.pools.get(u.token_id);
-      if (state && !u.is_withdrawn) {
-        state.set(u.new_utxo_hash, { sats: u.sats, tokens: u.token_amount });
-      }
-    }
-    for (const u of utxos) {
-      if (u.spent_utxo_hash !== ZERO_HASH)
-        this.pools.get(u.token_id)?.delete(u.spent_utxo_hash);
+      items = rest;
     }
 
-    // 5) classify each changed pool
-    utxos.forEach((u, i) => {
-      const old = olds[i];
-      const agg = this.pending.get(u.new_utxo_txid);
-      if (!old || !agg || u.is_withdrawn) return;
+    // still missing their parent: wait a few seconds for it, then apply without a trade
+    const now = Date.now();
+    const waiting = [];
+    for (const it of items) {
+      if (now - it.at >= ORPHAN_WAIT_MS) this.apply(tokenId, state, it.u);
+      else waiting.push(it);
+    }
+    if (waiting.length) {
+      this.buffers.set(
+        tokenId,
+        waiting.concat(this.buffers.get(tokenId) ?? []),
+      );
+      this.scheduleDrain(tokenId, REORDER_MS);
+    }
+  }
 
+  apply(tokenId, state, u) {
+    const old = state.get(u.spent_utxo_hash);
+    const txid = u.new_utxo_txid;
+
+    if (old && !u.is_withdrawn && !this.seen.has(txid)) {
       const dSats = u.sats - old.sats;
       const dTokens = u.token_amount - old.tokens;
-      if (dSats > 0 && dTokens < 0) {
-        agg.buy.sats += dSats;
-        agg.buy.tokens += -dTokens;
-      } else if (dSats < 0 && dTokens > 0) {
-        agg.sell.sats += -dSats;
-        agg.sell.tokens += dTokens;
+      const side =
+        dSats > 0 && dTokens < 0
+          ? "buy"
+          : dSats < 0 && dTokens > 0
+            ? "sell"
+            : null;
+      if (side) {
+        let agg = this.pending.get(txid);
+        if (!agg) {
+          agg = {
+            tokenId,
+            txid,
+            priceBefore: this.snapshot(tokenId).price, // before this tx touches the state
+            buy: { sats: 0, tokens: 0 },
+            sell: { sats: 0, tokens: 0 },
+            timer: null,
+          };
+          this.pending.set(txid, agg);
+        }
+        agg[side].sats += Math.abs(dSats);
+        agg[side].tokens += Math.abs(dTokens);
+        clearTimeout(agg.timer);
+        agg.timer = setTimeout(() => this.flush(txid), config.batchWindowMs);
       }
-      clearTimeout(agg.timer);
-      agg.timer = setTimeout(() => this.flush(agg.txid), config.batchWindowMs);
-    });
+    }
+
+    if (u.spent_utxo_hash !== ZERO_HASH) {
+      state.delete(u.spent_utxo_hash);
+      this.spent.add(u.spent_utxo_hash);
+      if (this.spent.size > 20000)
+        this.spent.delete(this.spent.values().next().value);
+    }
+    if (!u.is_withdrawn && !this.spent.has(u.new_utxo_hash)) {
+      state.set(u.new_utxo_hash, { sats: u.sats, tokens: u.token_amount });
+    }
   }
 
   flush(txid) {
